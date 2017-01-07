@@ -43,8 +43,7 @@
  */
 static int sunos_init(struct libusb_context *);
 static void sunos_exit(void);
-static int sunos_get_device_list(struct libusb_context *,
-    struct discovered_devs **);
+static int sunos_scan_devices(struct libusb_context *);
 static int sunos_open(struct libusb_device_handle *);
 static void sunos_close(struct libusb_device_handle *);
 static int sunos_get_device_descriptor(struct libusb_device *,
@@ -76,7 +75,9 @@ static int sunos_usb_get_status(int fd);
 
 static int sunos_init(struct libusb_context *ctx)
 {
-	return (LIBUSB_SUCCESS);
+	int rc;
+	rc = sunos_scan_devices(ctx);
+	return (rc);
 }
 
 static void sunos_exit(void)
@@ -88,7 +89,7 @@ static int
 sunos_fill_in_dev_info(di_node_t node, struct libusb_device *dev)
 {
 	int	proplen;
-	int	n, *addr, *port_prop;
+	int	n, *addr, *port_prop, *propval;
 	char	*phypath;
 	uint8_t	*rdata;
 	struct libusb_device_descriptor	*descr;
@@ -153,13 +154,13 @@ sunos_fill_in_dev_info(di_node_t node, struct libusb_device *dev)
 	}
 
 	/* speed */
-	if (di_prop_exists(DDI_DEV_T_ANY, node, "low-speed") == 1) {
+	if (di_prop_lookup_ints(DDI_DEV_T_ANY, node, "low-speed", &propval) == 0) {
 		dev->speed = LIBUSB_SPEED_LOW;
-	} else if (di_prop_exists(DDI_DEV_T_ANY, node, "high-speed") == 1) {
+	} else if (di_prop_lookup_ints(DDI_DEV_T_ANY, node, "high-speed", &propval) == 0) {
 		dev->speed = LIBUSB_SPEED_HIGH;
-	} else if (di_prop_exists(DDI_DEV_T_ANY, node, "full-speed") == 1) {
+	} else if (di_prop_lookup_ints(DDI_DEV_T_ANY, node, "full-speed", &propval) == 0) {
 		dev->speed = LIBUSB_SPEED_FULL;
-	} else if (di_prop_exists(DDI_DEV_T_ANY, node, "super-speed") == 1) {
+	} else if (di_prop_lookup_ints(DDI_DEV_T_ANY, node, "super-speed", &propval) == 0) {
 		dev->speed = LIBUSB_SPEED_SUPER;
 	}
 
@@ -183,7 +184,7 @@ sunos_add_devices(di_devlink_t link, void *arg)
 	sunos_dev_priv_t	*devpriv;
 	const char		*path, *newpath;
 	int			 n, i;
-	int			*addr_prop;
+	int			*addr_prop, *temp;
 	uint8_t			bus_number = 0;
 
 	nargs = (struct node_args *)largs->nargs;
@@ -200,7 +201,7 @@ sunos_add_devices(di_devlink_t link, void *arg)
 	pnode = myself;
 	i = 0;
 	while (pnode != DI_NODE_NIL) {
-		if (di_prop_exists(DDI_DEV_T_ANY, pnode, "root-hub") == 1) {
+		if (di_prop_lookup_ints(DDI_DEV_T_ANY, pnode, "root-hub", &temp) == 0) {
 			/* walk to root */
 			uint32_t *regbuf = NULL;
 			uint32_t reg;
@@ -275,21 +276,13 @@ sunos_add_devices(di_devlink_t link, void *arg)
 	if (nargs->last_ugenpath == NULL) {
 		/* first device */
 		nargs->last_ugenpath = devpriv->ugenpath;
-
-		if (discovered_devs_append(*(nargs->discdevs), dev) == NULL) {
-			usbi_dbg("cannot append device");
-		}
-
-		/*
-		 * we alloc and hence ref this dev. We don't need to ref it
-		 * hereafter. Front end or app should take care of their ref.
-		 */
+		usbi_connect_device(dev);
+	} else {
 		libusb_unref_device(dev);
 	}
 
-	usbi_dbg("Device %s %s id=0x%llx, devcount:%d, bdf=%x",
-	    devpriv->ugenpath, path, (uint64_t)session_id,
-	    (*nargs->discdevs)->len, bdf);
+	usbi_dbg("Device %s %s id=0x%llx, bdf=%x",
+	    devpriv->ugenpath, path, (uint64_t)session_id, bdf);
 
 	return (DI_WALK_CONTINUE);
 }
@@ -322,15 +315,13 @@ sunos_walk_minor_node_link(di_node_t node, void *args)
 }
 
 int
-sunos_get_device_list(struct libusb_context * ctx,
-	struct discovered_devs **discdevs)
+sunos_scan_devices(struct libusb_context * ctx)
 {
 	di_node_t root_node;
 	struct node_args args;
 	di_devlink_handle_t devlink_hdl;
 
 	args.ctx = ctx;
-	args.discdevs = discdevs;
 	args.last_ugenpath = NULL;
 	if ((root_node = di_init("/", DINFOCPYALL)) == DI_NODE_NIL) {
 		usbi_dbg("di_int() failed: %s", strerror(errno));
@@ -357,9 +348,7 @@ sunos_get_device_list(struct libusb_context * ctx,
 	di_fini(root_node);
 	di_devlink_fini(&devlink_hdl);
 
-	usbi_dbg("%d devices", (*discdevs)->len);
-
-	return ((*discdevs)->len);
+	return (0);
 }
 
 static int
@@ -976,10 +965,9 @@ solaris_submit_ctrl_on_default(struct libusb_transfer *transfer)
 	usbi_dbg("Done: ctrl data bytes %d", ret);
 
 	/* sync transfer handling */
-	ret = usbi_handle_transfer_completion(LIBUSB_TRANSFER_TO_USBI_TRANSFER(transfer),
-	    transfer->status);
+	usbi_signal_transfer_completion(LIBUSB_TRANSFER_TO_USBI_TRANSFER(transfer));
 
-	return (ret);
+	return (0);
 }
 
 int
@@ -1120,8 +1108,6 @@ sunos_handle_transfer_completion(struct usbi_transfer *itransfer)
 int
 sunos_clock_gettime(int clkid, struct timespec *tp)
 {
-	usbi_dbg("clock %d", clkid);
-
 	if (clkid == USBI_CLOCK_REALTIME)
 		return clock_gettime(CLOCK_REALTIME, tp);
 
@@ -1259,7 +1245,7 @@ const struct usbi_os_backend sunos_backend = {
         .caps = 0,
         .init = sunos_init,
         .exit = sunos_exit,
-        .get_device_list = sunos_get_device_list,
+        .get_device_list = NULL,
         .get_device_descriptor = sunos_get_device_descriptor,
         .get_active_config_descriptor = sunos_get_active_config_descriptor,
         .get_config_descriptor = sunos_get_config_descriptor,

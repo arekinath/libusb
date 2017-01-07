@@ -728,10 +728,18 @@ void usbi_disconnect_device(struct libusb_device *dev)
 	struct libusb_context *ctx = DEVICE_CTX(dev);
 
 	usbi_mutex_lock(&dev->lock);
+	if (dev->attached == 0) {
+		usbi_mutex_unlock(&dev->lock);
+		return;
+	}
 	dev->attached = 0;
 	usbi_mutex_unlock(&dev->lock);
 
 	usbi_mutex_lock(&ctx->usb_devs_lock);
+	if (dev->list.next == NULL || dev->list.prev == NULL) {
+		usbi_mutex_unlock(&ctx->usb_devs_lock);
+		return;
+	}
 	list_del(&dev->list);
 	usbi_mutex_unlock(&ctx->usb_devs_lock);
 
